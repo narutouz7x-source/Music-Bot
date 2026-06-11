@@ -1,5 +1,5 @@
 import { Client, GatewayIntentBits, Events, Collection, Interaction } from "discord.js";
-import { commands } from "./commands.js";
+import { commands, handleButton } from "./commands.js";
 import { logger } from "../lib/logger.js";
 
 type CommandLike = (typeof commands)[number];
@@ -22,6 +22,20 @@ export function createBotClient(): Client {
   });
 
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+    if (interaction.isButton()) {
+      if (interaction.customId.startsWith("music_")) {
+        try {
+          await handleButton(interaction);
+        } catch (err) {
+          logger.error({ err, customId: interaction.customId }, "Error handling button");
+          if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
+          }
+        }
+      }
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     const command = commandMap.get(interaction.commandName);

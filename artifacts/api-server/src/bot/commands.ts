@@ -1,9 +1,13 @@
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
+  ButtonInteraction,
   GuildMember,
   EmbedBuilder,
   Colors,
+  TextChannel,
+  NewsChannel,
+  ThreadChannel,
 } from "discord.js";
 import {
   joinVoiceChannel,
@@ -13,54 +17,128 @@ import {
 } from "@discordjs/voice";
 import playdl from "play-dl";
 import { GuildPlayer } from "./player.js";
+import { PlayerEmbed } from "./embed.js";
 import { logger } from "../lib/logger.js";
 
 const players = new Map<string, GuildPlayer>();
+const embeds = new Map<string, PlayerEmbed>();
+
+export function getPlayers(): Map<string, GuildPlayer> {
+  return players;
+}
+
+export function getEmbeds(): Map<string, PlayerEmbed> {
+  return embeds;
+}
 
 function getOrCreatePlayer(guildId: string): GuildPlayer {
   if (!players.has(guildId)) {
-    players.set(guildId, new GuildPlayer(guildId));
+    const p = new GuildPlayer(guildId);
+    players.set(guildId, p);
+    const embed = new PlayerEmbed(p);
+    embeds.set(guildId, embed);
   }
   return players.get(guildId)!;
 }
 
-function embed(color: number, description: string, title?: string): EmbedBuilder {
+function reply(color: number, description: string, title?: string): EmbedBuilder {
   const e = new EmbedBuilder().setColor(color).setDescription(description);
   if (title) e.setTitle(title);
   return e;
 }
+const err = (msg: string) => reply(Colors.Red, msg);
+const ok = (msg: string, title?: string) => reply(Colors.Green, msg, title);
+const info = (msg: string, title?: string) => reply(Colors.Blurple, msg, title);
 
-function errorEmbed(msg: string): EmbedBuilder {
-  return embed(Colors.Red, msg);
-}
-
-function successEmbed(msg: string, title?: string): EmbedBuilder {
-  return embed(Colors.Green, msg, title);
-}
-
-function infoEmbed(msg: string, title?: string): EmbedBuilder {
-  return embed(Colors.Blurple, msg, title);
-}
-
-async function ensureVoiceChannel(
-  interaction: ChatInputCommandInteraction
-): Promise<{ channelId: string; guildId: string; adapterCreator: unknown } | null> {
+async function ensureVoice(interaction: ChatInputCommandInteraction | ButtonInteraction) {
   const member = interaction.member as GuildMember;
-  const voiceChannel = member?.voice?.channel;
-
-  if (!voiceChannel) {
-    await interaction.reply({
-      embeds: [errorEmbed("You must be in a voice channel to use this command.")],
-      ephemeral: true,
-    });
+  const vc = member?.voice?.channel;
+  if (!vc) {
+    await interaction.reply({ embeds: [err("You must be in a voice channel.")], ephemeral: true });
     return null;
   }
+  return vc;
+}
 
+async function ensureConnected(
+  guildId: string,
+  player: GuildPlayer,
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+): Promise<boolean> {
+  const vc = await ensureVoice(interaction);
+  if (!vc) return false;
+
+  let connection = getVoiceConnection(guildId);
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: vc.id,
+      guildId: vc.guild.id,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      adapterCreator: vc.guild.voiceAdapterCreator as any,
+      selfDeaf: true,
+    });
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    } catch (e) {
+      connection.destroy();
+      logger.error({ err: e }, "Failed to connect to voice channel");
+      await interaction.reply({ embeds: [err("Failed to join voice channel.")], ephemeral: true });
+      return false;
+    }
+
+    player.setConnection(connection);
+
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([
+          entersState(connection!, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection!, VoiceConnectionStatus.Connecting, 5_000),
+        ]);
+      } catch {
+        connection!.destroy();
+        player.disconnect();
+        players.delete(guildId);
+        embeds.delete(guildId);
+      }
+    });
+  }
+
+  return true;
+}
+
+async function resolveTrack(query: string): Promise<{ title: string; url: string; duration: string; thumbnail: string } | null> {
+  if (playdl.yt_validate(query) === "video") {
+    const info = await playdl.video_info(query);
+    const v = info.video_details;
+    const secs = v.durationInSec ?? 0;
+    return {
+      title: v.title ?? "Unknown",
+      url: query,
+      duration: formatDuration(secs),
+      thumbnail: v.thumbnails?.[0]?.url ?? "",
+    };
+  }
+
+  const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
+  if (!results.length) return null;
+  const v = results[0]!;
+  const secs = v.durationInSec ?? 0;
   return {
-    channelId: voiceChannel.id,
-    guildId: voiceChannel.guild.id,
-    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    title: v.title ?? "Unknown",
+    url: v.url,
+    duration: formatDuration(secs),
+    thumbnail: v.thumbnails?.[0]?.url ?? "",
   };
+}
+
+function formatDuration(secs: number): string {
+  if (!secs) return "Live";
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 export const commands = [
@@ -73,85 +151,68 @@ export const commands = [
       ),
     async execute(interaction: ChatInputCommandInteraction) {
       await interaction.deferReply();
-
-      const voiceInfo = await ensureVoiceChannel(interaction);
-      if (!voiceInfo) return;
-
-      const query = interaction.options.getString("query", true);
       const guildId = interaction.guildId!;
       const player = getOrCreatePlayer(guildId);
 
+      const connected = await ensureConnected(guildId, player, interaction);
+      if (!connected) return;
+
+      const query = interaction.options.getString("query", true);
+
       try {
-        let url: string;
-        let title: string;
-
-        if (playdl.yt_validate(query) === "video") {
-          const info = await playdl.video_info(query);
-          url = query;
-          title = info.video_details.title ?? "Unknown";
-        } else {
-          const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
-          if (!results.length) {
-            await interaction.editReply({ embeds: [errorEmbed("No results found.")] });
-            return;
-          }
-          url = results[0]!.url;
-          title = results[0]!.title ?? "Unknown";
+        const track = await resolveTrack(query);
+        if (!track) {
+          await interaction.editReply({ embeds: [err("No results found.")] });
+          return;
         }
 
-        let connection = getVoiceConnection(guildId);
-        if (!connection) {
-          connection = joinVoiceChannel({
-            channelId: voiceInfo.channelId,
-            guildId: voiceInfo.guildId,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            adapterCreator: voiceInfo.adapterCreator as any,
-            selfDeaf: true,
-          });
+        const entry = { ...track, requestedBy: interaction.user.tag };
 
-          try {
-            await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-          } catch (err) {
-            connection.destroy();
-            logger.error({ err }, "Failed to connect to voice channel");
-            await interaction.editReply({ embeds: [errorEmbed("Failed to join voice channel.")] });
-            return;
-          }
-
-          player.setConnection(connection);
-
-          connection.on(VoiceConnectionStatus.Disconnected, async () => {
-            try {
-              await Promise.race([
-                entersState(connection!, VoiceConnectionStatus.Signalling, 5_000),
-                entersState(connection!, VoiceConnectionStatus.Connecting, 5_000),
-              ]);
-            } catch {
-              connection!.destroy();
-              player.disconnect();
-              players.delete(guildId);
-            }
-          });
-        }
-
-        const entry = { title, url, requestedBy: interaction.user.tag };
-
-        if (player.isPlaying() || player.isPaused()) {
+        if (player.isActive()) {
           player.queue.enqueue(entry);
           await interaction.editReply({
-            embeds: [successEmbed(`Added to queue (position ${player.queue.length}): **${title}**`)],
+            embeds: [ok(`Added to queue (position **${player.queue.length}**)\n**${track.title}**`)],
           });
         } else {
           player.queue.enqueue(entry);
           await player.processQueue();
           await interaction.editReply({
-            embeds: [successEmbed(`🎵 Now playing: **${title}**`, "Now Playing")],
+            embeds: [ok(`▶️ Now playing: **${track.title}**`, "Now Playing")],
           });
         }
-      } catch (err) {
-        logger.error({ err }, "Error in /play");
-        await interaction.editReply({ embeds: [errorEmbed("Something went wrong while trying to play that track.")] });
+      } catch (e) {
+        logger.error({ err: e }, "Error in /play");
+        await interaction.editReply({ embeds: [err("Something went wrong trying to play that track.")] });
       }
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName("player")
+      .setDescription("Open the interactive music player panel"),
+    async execute(interaction: ChatInputCommandInteraction) {
+      const guildId = interaction.guildId!;
+      const player = getOrCreatePlayer(guildId);
+
+      const channel = interaction.channel as TextChannel | NewsChannel | ThreadChannel;
+      if (!channel?.isTextBased()) {
+        await interaction.reply({ embeds: [err("This command can only be used in a text channel.")], ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+
+      const embed = embeds.get(guildId)!;
+      const msg = await embed.send(channel);
+
+      await interaction.editReply({
+        embeds: [info(`🎛️ Player panel opened above.`)],
+      });
+
+      setTimeout(() => interaction.deleteReply().catch(() => {}), 4000);
+
+      logger.info({ guildId, messageId: msg.id }, "Player embed sent");
     },
   },
 
@@ -160,14 +221,13 @@ export const commands = [
       .setName("pause")
       .setDescription("Pause the current track"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
+      const player = players.get(interaction.guildId!);
       if (!player?.isPlaying()) {
-        await interaction.reply({ embeds: [errorEmbed("Nothing is playing.")], ephemeral: true });
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
         return;
       }
       player.pause();
-      await interaction.reply({ embeds: [infoEmbed("⏸ Paused.")] });
+      await interaction.reply({ embeds: [info("⏸️ Paused.")] });
     },
   },
 
@@ -176,14 +236,13 @@ export const commands = [
       .setName("resume")
       .setDescription("Resume the paused track"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
+      const player = players.get(interaction.guildId!);
       if (!player?.isPaused()) {
-        await interaction.reply({ embeds: [errorEmbed("Nothing is paused.")], ephemeral: true });
+        await interaction.reply({ embeds: [err("Nothing is paused.")], ephemeral: true });
         return;
       }
       player.resume();
-      await interaction.reply({ embeds: [infoEmbed("▶️ Resumed.")] });
+      await interaction.reply({ embeds: [info("▶️ Resumed.")] });
     },
   },
 
@@ -192,14 +251,13 @@ export const commands = [
       .setName("skip")
       .setDescription("Skip the current track"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
-      if (!player?.isPlaying() && !player?.isPaused()) {
-        await interaction.reply({ embeds: [errorEmbed("Nothing is playing.")], ephemeral: true });
+      const player = players.get(interaction.guildId!);
+      if (!player?.isActive()) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
         return;
       }
       player.skip();
-      await interaction.reply({ embeds: [infoEmbed("⏭ Skipped.")] });
+      await interaction.reply({ embeds: [info("⏭️ Skipped.")] });
     },
   },
 
@@ -208,14 +266,13 @@ export const commands = [
       .setName("stop")
       .setDescription("Stop playback and clear the queue"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
-      if (!player) {
-        await interaction.reply({ embeds: [errorEmbed("Nothing is playing.")], ephemeral: true });
+      const player = players.get(interaction.guildId!);
+      if (!player?.isActive()) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
         return;
       }
       player.stop();
-      await interaction.reply({ embeds: [infoEmbed("⏹ Stopped and queue cleared.")] });
+      await interaction.reply({ embeds: [info("⏹️ Stopped and queue cleared.")] });
     },
   },
 
@@ -224,34 +281,26 @@ export const commands = [
       .setName("queue")
       .setDescription("Show the current queue"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
+      const player = players.get(interaction.guildId!);
       const current = player?.getCurrentEntry();
       const queue = player?.queue.getAll() ?? [];
 
       if (!current && queue.length === 0) {
-        await interaction.reply({ embeds: [infoEmbed("The queue is empty.")], ephemeral: true });
+        await interaction.reply({ embeds: [info("The queue is empty.")], ephemeral: true });
         return;
       }
 
       const lines: string[] = [];
-      if (current) {
-        lines.push(`**Now Playing:** ${current.title} — *${current.requestedBy}*`);
-      }
+      if (current) lines.push(`**▶️ Now Playing:** [${current.title}](${current.url}) \`${current.duration}\` — *${current.requestedBy}*`);
       if (queue.length > 0) {
-        lines.push("");
-        lines.push("**Up Next:**");
+        lines.push("\n**Up Next:**");
         queue.slice(0, 10).forEach((e, i) => {
-          lines.push(`${i + 1}. ${e.title} — *${e.requestedBy}*`);
+          lines.push(`\`${i + 1}.\` [${e.title}](${e.url}) \`${e.duration}\` — *${e.requestedBy}*`);
         });
-        if (queue.length > 10) {
-          lines.push(`…and ${queue.length - 10} more`);
-        }
+        if (queue.length > 10) lines.push(`\n…and **${queue.length - 10}** more`);
       }
 
-      await interaction.reply({
-        embeds: [infoEmbed(lines.join("\n"), "Queue")],
-      });
+      await interaction.reply({ embeds: [info(lines.join("\n"), "📋 Queue")] });
     },
   },
 
@@ -260,15 +309,24 @@ export const commands = [
       .setName("nowplaying")
       .setDescription("Show the currently playing track"),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
+      const player = players.get(interaction.guildId!);
       const current = player?.getCurrentEntry();
       if (!current) {
-        await interaction.reply({ embeds: [infoEmbed("Nothing is playing.")], ephemeral: true });
+        await interaction.reply({ embeds: [info("Nothing is playing.")], ephemeral: true });
         return;
       }
       await interaction.reply({
-        embeds: [infoEmbed(`🎵 **${current.title}**\nRequested by: ${current.requestedBy}`, "Now Playing")],
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.Green)
+            .setTitle("▶️ Now Playing")
+            .setDescription(`**[${current.title}](${current.url})**`)
+            .setThumbnail(current.thumbnail)
+            .addFields(
+              { name: "👤 Requested by", value: current.requestedBy, inline: true },
+              { name: "⏱️ Duration", value: current.duration, inline: true },
+            ),
+        ],
       });
     },
   },
@@ -278,30 +336,22 @@ export const commands = [
       .setName("volume")
       .setDescription("Set or check the playback volume")
       .addIntegerOption((opt) =>
-        opt
-          .setName("level")
-          .setDescription("Volume level (0–100)")
-          .setMinValue(0)
-          .setMaxValue(100)
+        opt.setName("level").setDescription("Volume level (0–100)").setMinValue(0).setMaxValue(100)
       ),
     async execute(interaction: ChatInputCommandInteraction) {
-      const guildId = interaction.guildId!;
-      const player = players.get(guildId);
-
+      const player = players.get(interaction.guildId!);
       const level = interaction.options.getInteger("level");
       if (level === null) {
         const vol = player?.getVolume() ?? 50;
-        await interaction.reply({ embeds: [infoEmbed(`Current volume: **${vol}%**`)] });
+        await interaction.reply({ embeds: [info(`🔊 Volume: **${vol}%**`)] });
         return;
       }
-
       if (!player) {
-        await interaction.reply({ embeds: [errorEmbed("Nothing is playing.")], ephemeral: true });
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
         return;
       }
-
       player.setVolume(level / 100);
-      await interaction.reply({ embeds: [successEmbed(`🔊 Volume set to **${level}%**`)] });
+      await interaction.reply({ embeds: [ok(`🔊 Volume set to **${level}%**`)] });
     },
   },
 
@@ -313,12 +363,104 @@ export const commands = [
       const guildId = interaction.guildId!;
       const player = players.get(guildId);
       if (!player) {
-        await interaction.reply({ embeds: [errorEmbed("I'm not in a voice channel.")], ephemeral: true });
+        await interaction.reply({ embeds: [err("I'm not in a voice channel.")], ephemeral: true });
         return;
       }
+      const embed = embeds.get(guildId);
+      await embed?.destroy();
+      embeds.delete(guildId);
       player.disconnect();
       players.delete(guildId);
-      await interaction.reply({ embeds: [infoEmbed("👋 Left the voice channel.")] });
+      await interaction.reply({ embeds: [info("👋 Left the voice channel.")] });
     },
   },
 ];
+
+export async function handleButton(interaction: ButtonInteraction): Promise<void> {
+  const guildId = interaction.guildId;
+  if (!guildId) return;
+
+  const player = players.get(guildId);
+
+  switch (interaction.customId) {
+    case "music_pause": {
+      if (!player?.isPlaying()) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
+        return;
+      }
+      player.pause();
+      await interaction.deferUpdate();
+      break;
+    }
+    case "music_resume": {
+      if (!player?.isPaused()) {
+        await interaction.reply({ embeds: [err("Nothing is paused.")], ephemeral: true });
+        return;
+      }
+      player.resume();
+      await interaction.deferUpdate();
+      break;
+    }
+    case "music_skip": {
+      if (!player?.isActive()) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
+        return;
+      }
+      player.skip();
+      await interaction.deferUpdate();
+      break;
+    }
+    case "music_prev": {
+      if (!player) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
+        return;
+      }
+      await interaction.deferUpdate();
+      const success = await player.previous();
+      if (!success) {
+        await interaction.followUp({ embeds: [err("No previous track in history.")], ephemeral: true });
+      }
+      break;
+    }
+    case "music_stop": {
+      if (!player?.isActive()) {
+        await interaction.reply({ embeds: [err("Nothing is playing.")], ephemeral: true });
+        return;
+      }
+      player.stop();
+      await interaction.deferUpdate();
+      break;
+    }
+    case "music_repeat": {
+      if (!player) {
+        await interaction.reply({ embeds: [err("No player active.")], ephemeral: true });
+        return;
+      }
+      const mode = player.cycleRepeat();
+      const labels: Record<string, string> = { off: "Off", one: "One", all: "All" };
+      await interaction.deferUpdate();
+      await interaction.followUp({ embeds: [info(`🔁 Repeat: **${labels[mode]}**`)], ephemeral: true });
+      break;
+    }
+    case "music_voldown": {
+      if (!player) {
+        await interaction.reply({ embeds: [err("No player active.")], ephemeral: true });
+        return;
+      }
+      player.setVolume((player.getVolume() - 10) / 100);
+      await interaction.deferUpdate();
+      break;
+    }
+    case "music_volup": {
+      if (!player) {
+        await interaction.reply({ embeds: [err("No player active.")], ephemeral: true });
+        return;
+      }
+      player.setVolume((player.getVolume() + 10) / 100);
+      await interaction.deferUpdate();
+      break;
+    }
+    default:
+      break;
+  }
+}
