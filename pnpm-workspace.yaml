@@ -70,6 +70,7 @@ autoInstallPeers: false
 
 onlyBuiltDependencies:
   - '@swc/core'
+  - '@discordjs/opus'
   - esbuild
   - msw
   - unrs-resolver
