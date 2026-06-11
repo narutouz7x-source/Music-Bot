@@ -28,21 +28,59 @@ app.listen(port, (err) => {
   logger.info({ port }, "Server listening");
 });
 
-async function startBot() {
-  const client = createBotClient();
-  await client.login(token);
+const RECONNECT_DELAY_MS = 5_000;
+const MAX_RECONNECT_DELAY_MS = 60_000;
 
-  client.once("ready", async (readyClient) => {
-    const clientId = readyClient.user.id;
-    try {
-      await registerCommands(clientId, token!);
-    } catch (err) {
-      logger.error({ err }, "Failed to register slash commands");
-    }
-  });
+async function startBot(attempt = 1): Promise<void> {
+  const delay = Math.min(RECONNECT_DELAY_MS * attempt, MAX_RECONNECT_DELAY_MS);
+
+  try {
+    const client = createBotClient();
+
+    client.once("ready", async (readyClient) => {
+      const clientId = readyClient.user.id;
+      try {
+        await registerCommands(clientId, token!);
+      } catch (err) {
+        logger.error({ err }, "Failed to register slash commands");
+      }
+    });
+
+    client.on("disconnect", () => {
+      logger.warn("Bot disconnected — will attempt reconnect");
+    });
+
+    client.on("shardError", (err) => {
+      logger.error({ err }, "Shard error");
+    });
+
+    client.on("invalidated", () => {
+      logger.error("Session invalidated — token may be invalid");
+    });
+
+    client.on("error", (err) => {
+      logger.error({ err }, "Discord client error");
+    });
+
+    await client.login(token);
+    logger.info({ attempt }, "Bot logged in successfully");
+
+    client.once("shardDisconnect", async (_, shardId) => {
+      logger.warn({ shardId }, "Shard disconnected — scheduling reconnect");
+      client.destroy();
+      await sleep(delay);
+      void startBot(1);
+    });
+
+  } catch (err) {
+    logger.error({ err, attempt }, "Bot login failed — retrying");
+    await sleep(delay);
+    void startBot(attempt + 1);
+  }
 }
 
-startBot().catch((err) => {
-  logger.error({ err }, "Fatal bot startup error");
-  process.exit(1);
-});
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+void startBot();
