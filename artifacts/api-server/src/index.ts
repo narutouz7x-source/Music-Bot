@@ -16,9 +16,7 @@ if (Number.isNaN(port) || port <= 0) {
 }
 
 const token = process.env["DISCORD_TOKEN"];
-if (!token) {
-  throw new Error("DISCORD_TOKEN environment variable is required.");
-}
+const botEnabled = process.env["BOT_ENABLED"] === "true";
 
 app.listen(port, (err) => {
   if (err) {
@@ -27,6 +25,15 @@ app.listen(port, (err) => {
   }
   logger.info({ port }, "Server listening");
 });
+
+if (!botEnabled) {
+  logger.info("BOT_ENABLED is not set — bot will not start (set BOT_ENABLED=true on Render to enable)");
+} else {
+  if (!token) {
+    throw new Error("DISCORD_TOKEN environment variable is required when BOT_ENABLED=true.");
+  }
+  void startBot();
+}
 
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
@@ -44,10 +51,6 @@ async function startBot(attempt = 1): Promise<void> {
       } catch (err) {
         logger.error({ err }, "Failed to register slash commands");
       }
-    });
-
-    client.on("disconnect", () => {
-      logger.warn("Bot disconnected — will attempt reconnect");
     });
 
     client.on("shardError", (err) => {
@@ -82,5 +85,3 @@ async function startBot(attempt = 1): Promise<void> {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-void startBot();
