@@ -113,7 +113,7 @@ export class GuildPlayer {
   async play(entry: QueueEntry): Promise<void> {
     this.currentEntry = entry;
 
-    const stream = await createStream(entry.url, entry.source);
+    const stream = await createStream(entry);
 
     const resource: AudioResource = createAudioResource(stream, {
       inputType: StreamType.Arbitrary,

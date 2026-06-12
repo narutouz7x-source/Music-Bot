@@ -5,6 +5,7 @@ export interface QueueEntry {
   thumbnail: string;
   requestedBy: string;
   source: "youtube" | "soundcloud";
+  scFallbackQuery?: string;
 }
 
 export type RepeatMode = "off" | "one" | "all";
