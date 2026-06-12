@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { execSync } from "node:child_process";
 import playdl from "play-dl";
 import { logger } from "../lib/logger.js";
 
@@ -18,6 +19,17 @@ function formatDuration(secs: number): string {
   const s = secs % 60;
   if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Validate FFmpeg is available
+function validateFFmpeg(): boolean {
+  try {
+    execSync("ffmpeg -version", { stdio: "ignore" });
+    return true;
+  } catch {
+    logger.warn("FFmpeg not found in PATH — audio streaming may fail");
+    return false;
+  }
 }
 
 async function searchSoundCloud(query: string): Promise<TrackInfo | null> {
@@ -111,27 +123,64 @@ export async function resolveTrack(query: string): Promise<TrackInfo | null> {
 
 export async function createStream(track: TrackInfo): Promise<Readable> {
   if (track.source === "soundcloud") {
-    const s = await playdl.stream(track.url);
-    return s.stream as unknown as Readable;
+    try {
+      const s = await playdl.stream(track.url);
+      if (!s || !s.stream) {
+        throw new Error("SoundCloud stream returned empty");
+      }
+      logger.info({ url: track.url }, "SoundCloud stream created successfully");
+      return s.stream as unknown as Readable;
+    } catch (err) {
+      logger.error({ err, url: track.url }, "Failed to create SoundCloud stream");
+      throw err;
+    }
   }
 
-  // YouTube — attempt stream, fall back to SoundCloud if blocked
+  // YouTube — attempt stream with fallback
   try {
+    logger.info({ url: track.url }, "Attempting YouTube stream (quality: 2)");
     const s = await playdl.stream(track.url, { quality: 2 });
+    if (!s || !s.stream) {
+      throw new Error("YouTube stream returned empty");
+    }
+    logger.info({ url: track.url }, "YouTube stream created successfully");
     return s.stream as unknown as Readable;
   } catch (ytErr) {
-    logger.warn({ err: ytErr, url: track.url }, "YouTube stream blocked, falling back to SoundCloud");
+    logger.warn({ err: ytErr, url: track.url }, "YouTube stream failed, attempting quality 1");
 
-    if (track.scFallbackQuery) {
-      const scTrack = await searchSoundCloud(track.scFallbackQuery);
-      if (scTrack) {
-        track.source = "soundcloud";
-        track.url = scTrack.url;
-        const s = await playdl.stream(scTrack.url);
-        return s.stream as unknown as Readable;
+    // Retry with lower quality
+    try {
+      const s = await playdl.stream(track.url, { quality: 1 });
+      if (!s || !s.stream) {
+        throw new Error("YouTube stream (quality 1) returned empty");
       }
-    }
+      logger.info({ url: track.url }, "YouTube stream created successfully with quality 1");
+      return s.stream as unknown as Readable;
+    } catch (qualityErr) {
+      logger.warn({ err: qualityErr, url: track.url }, "YouTube quality 1 also failed, trying SoundCloud fallback");
 
-    throw new Error(`Cannot stream "${track.title}" — YouTube blocked and no SoundCloud match found.`);
+      if (track.scFallbackQuery) {
+        const scTrack = await searchSoundCloud(track.scFallbackQuery);
+        if (scTrack) {
+          try {
+            const s = await playdl.stream(scTrack.url);
+            if (!s || !s.stream) {
+              throw new Error("SoundCloud fallback stream returned empty");
+            }
+            logger.info({ url: scTrack.url }, "SoundCloud fallback stream created successfully");
+            track.source = "soundcloud";
+            track.url = scTrack.url;
+            return s.stream as unknown as Readable;
+          } catch (scErr) {
+            logger.error({ err: scErr, url: scTrack.url }, "SoundCloud fallback stream failed");
+          }
+        }
+      }
+
+      throw new Error(`Cannot stream "${track.title}" — all sources failed (YouTube and SoundCloud fallback).`);
+    }
   }
 }
+
+// Validate FFmpeg on startup
+validateFFmpeg();
