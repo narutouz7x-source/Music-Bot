@@ -9,8 +9,13 @@ import {
   StreamType,
 } from "@discordjs/voice";
 import playdl from "play-dl";
+import ffmpegStatic from "ffmpeg-static";
 import { MusicQueue, QueueEntry } from "./queue.js";
 import { logger } from "../lib/logger.js";
+
+if (ffmpegStatic) {
+  process.env["FFMPEG_PATH"] = ffmpegStatic;
+}
 
 export type PlayerEvent = "trackStart" | "trackEnd" | "queueEmpty" | "stateChange";
 
@@ -111,14 +116,14 @@ export class GuildPlayer {
     const stream = await playdl.stream(entry.url, { quality: 2 });
 
     const resource: AudioResource = createAudioResource(stream.stream, {
-      inputType: stream.type as StreamType,
+      inputType: StreamType.Arbitrary,
       inlineVolume: true,
     });
 
     resource.volume?.setVolume(this.volume);
     this.audioPlayer.play(resource);
 
-    await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 15_000);
+    await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 20_000);
     logger.info({ guildId: this.guildId, title: entry.title }, "Now playing");
     this.emit("trackStart");
   }

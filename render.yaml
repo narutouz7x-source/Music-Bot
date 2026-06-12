@@ -4,7 +4,7 @@ services:
     runtime: node
     region: oregon
     plan: free
-    buildCommand: npx pnpm@10 install --frozen-lockfile --ignore-scripts && npx pnpm@10 --filter @workspace/api-server run build
+    buildCommand: npx pnpm@10 install --frozen-lockfile && npx pnpm@10 --filter @workspace/api-server run build
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
     envVars:
       - key: NODE_ENV
