@@ -109,7 +109,9 @@ async function ensureConnected(
 
 async function resolveTrack(query: string): Promise<{ title: string; url: string; duration: string; thumbnail: string } | null> {
   if (playdl.yt_validate(query) === "video") {
-    const info = await playdl.video_info(query);
+    const info = await playdl.video_info(query).catch((e) => {
+      throw new Error(`YouTube info fetch failed: ${String(e)}`);
+    });
     const v = info.video_details;
     const secs = v.durationInSec ?? 0;
     return {
@@ -120,7 +122,9 @@ async function resolveTrack(query: string): Promise<{ title: string; url: string
     };
   }
 
-  const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
+  const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 }).catch((e) => {
+    throw new Error(`YouTube search failed: ${String(e)}`);
+  });
   if (!results.length) return null;
   const v = results[0]!;
   const secs = v.durationInSec ?? 0;

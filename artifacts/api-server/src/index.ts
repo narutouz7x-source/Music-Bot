@@ -2,6 +2,7 @@ import app from "./app.js";
 import { logger } from "./lib/logger.js";
 import { createBotClient } from "./bot/client.js";
 import { registerCommands } from "./bot/register.js";
+import playdl from "play-dl";
 
 const rawPort = process.env["PORT"];
 
@@ -17,6 +18,14 @@ if (Number.isNaN(port) || port <= 0) {
 
 const token = process.env["DISCORD_TOKEN"];
 const botEnabled = process.env["BOT_ENABLED"] === "true";
+const youtubeCookie = process.env["YOUTUBE_COOKIE"];
+
+if (youtubeCookie) {
+  playdl.setToken({ youtube: { cookie: youtubeCookie } });
+  logger.info("YouTube cookie configured");
+} else {
+  logger.warn("YOUTUBE_COOKIE not set — YouTube may block requests from server IPs");
+}
 
 app.listen(port, (err) => {
   if (err) {
