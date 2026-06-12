@@ -8,6 +8,7 @@ import {
   AudioResource,
   StreamType,
 } from "@discordjs/voice";
+import { spawn } from "node:child_process";
 import ffmpegStatic from "ffmpeg-static";
 import { createStream } from "./streamer.js";
 import { MusicQueue, QueueEntry } from "./queue.js";
@@ -110,22 +111,64 @@ export class GuildPlayer {
     return this.isPlaying() || this.isPaused();
   }
 
+  private createFFmpegTranscoder(inputStream: NodeJS.ReadableStream) {
+    const ffmpeg = spawn(ffmpegStatic || "ffmpeg", [
+      "-i",
+      "pipe:0",
+      "-acodec",
+      "libopus",
+      "-af",
+      "aresample=48000",
+      "-f",
+      "ogg",
+      "pipe:1",
+    ]);
+
+    // Handle FFmpeg errors
+    ffmpeg.on("error", (err) => {
+      logger.error({ err, guildId: this.guildId }, "FFmpeg process error");
+    });
+
+    ffmpeg.stderr.on("data", (data) => {
+      const message = data.toString();
+      if (message.includes("error") || message.includes("Error")) {
+        logger.error({ guildId: this.guildId, ffmpegError: message }, "FFmpeg error message");
+      }
+    });
+
+    // Pipe input stream to FFmpeg
+    inputStream.pipe(ffmpeg.stdin);
+
+    return ffmpeg.stdout;
+  }
+
   async play(entry: QueueEntry): Promise<void> {
     this.currentEntry = entry;
 
-    const stream = await createStream(entry);
+    try {
+      logger.info({ guildId: this.guildId, title: entry.title, source: entry.source }, "Fetching stream...");
+      const stream = await createStream(entry);
 
-    const resource: AudioResource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
-      inlineVolume: true,
-    });
+      // Transcode through FFmpeg to OggOpus
+      logger.info({ guildId: this.guildId }, "Transcoding to OggOpus...");
+      const transcodedStream = this.createFFmpegTranscoder(stream);
 
-    resource.volume?.setVolume(this.volume);
-    this.audioPlayer.play(resource);
+      const resource: AudioResource = createAudioResource(transcodedStream, {
+        inputType: StreamType.OggOpus,
+        inlineVolume: true,
+      });
 
-    await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 30_000);
-    logger.info({ guildId: this.guildId, title: entry.title, source: entry.source }, "Now playing");
-    this.emit("trackStart");
+      resource.volume?.setVolume(this.volume);
+      this.audioPlayer.play(resource);
+
+      // Wait for audio to start playing
+      await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 30_000);
+      logger.info({ guildId: this.guildId, title: entry.title, source: entry.source }, "✅ Now playing");
+      this.emit("trackStart");
+    } catch (err) {
+      logger.error({ err, guildId: this.guildId, title: entry.title }, "Failed to play track");
+      throw err;
+    }
   }
 
   async processQueue(): Promise<void> {
