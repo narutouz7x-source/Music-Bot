@@ -30,6 +30,7 @@ async function buildAll() {
     external: [
       "*.node",
       "ffmpeg-static",
+      "@distube/ytdl-core",
       "opusscript",
       "sodium-native",
       "sodium",

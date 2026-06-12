@@ -8,8 +8,8 @@ import {
   AudioResource,
   StreamType,
 } from "@discordjs/voice";
-import playdl from "play-dl";
 import ffmpegStatic from "ffmpeg-static";
+import { createYtdlpStream } from "./streamer.js";
 import { MusicQueue, QueueEntry } from "./queue.js";
 import { logger } from "../lib/logger.js";
 
@@ -113,9 +113,9 @@ export class GuildPlayer {
   async play(entry: QueueEntry): Promise<void> {
     this.currentEntry = entry;
 
-    const stream = await playdl.stream(entry.url, { quality: 2 });
+    const stream = createYtdlpStream(entry.url);
 
-    const resource: AudioResource = createAudioResource(stream.stream, {
+    const resource: AudioResource = createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
       inlineVolume: true,
     });
@@ -123,7 +123,7 @@ export class GuildPlayer {
     resource.volume?.setVolume(this.volume);
     this.audioPlayer.play(resource);
 
-    await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 20_000);
+    await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 30_000);
     logger.info({ guildId: this.guildId, title: entry.title }, "Now playing");
     this.emit("trackStart");
   }

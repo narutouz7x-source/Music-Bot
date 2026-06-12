@@ -15,7 +15,7 @@ import {
   VoiceConnectionStatus,
   entersState,
 } from "@discordjs/voice";
-import playdl from "play-dl";
+import { resolveTrack } from "./streamer.js";
 import { GuildPlayer } from "./player.js";
 import { PlayerEmbed } from "./embed.js";
 import { logger } from "../lib/logger.js";
@@ -107,43 +107,6 @@ async function ensureConnected(
   return true;
 }
 
-async function resolveTrack(query: string): Promise<{ title: string; url: string; duration: string; thumbnail: string } | null> {
-  if (playdl.yt_validate(query) === "video") {
-    const info = await playdl.video_info(query).catch((e) => {
-      throw new Error(`YouTube info fetch failed: ${String(e)}`);
-    });
-    const v = info.video_details;
-    const secs = v.durationInSec ?? 0;
-    return {
-      title: v.title ?? "Unknown",
-      url: query,
-      duration: formatDuration(secs),
-      thumbnail: v.thumbnails?.[0]?.url ?? "",
-    };
-  }
-
-  const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 }).catch((e) => {
-    throw new Error(`YouTube search failed: ${String(e)}`);
-  });
-  if (!results.length) return null;
-  const v = results[0]!;
-  const secs = v.durationInSec ?? 0;
-  return {
-    title: v.title ?? "Unknown",
-    url: v.url,
-    duration: formatDuration(secs),
-    thumbnail: v.thumbnails?.[0]?.url ?? "",
-  };
-}
-
-function formatDuration(secs: number): string {
-  if (!secs) return "Live";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  const s = secs % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${m}:${String(s).padStart(2, "0")}`;
-}
 
 export const commands = [
   {
