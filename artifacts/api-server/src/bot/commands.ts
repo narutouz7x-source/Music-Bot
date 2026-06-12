@@ -337,17 +337,33 @@ export const commands = [
       .setDescription("Disconnect the bot from the voice channel"),
     async execute(interaction: ChatInputCommandInteraction) {
       const guildId = interaction.guildId!;
+      
+      // Check for voice connection (bot might be connected but player not initialized)
+      const connection = getVoiceConnection(guildId);
       const player = players.get(guildId);
-      if (!player) {
+
+      if (!connection && !player) {
         await interaction.reply({ embeds: [err("I'm not in a voice channel.")], ephemeral: true });
         return;
       }
-      const embed = embeds.get(guildId);
-      await embed?.destroy();
-      embeds.delete(guildId);
-      player.disconnect();
-      players.delete(guildId);
-      await interaction.reply({ embeds: [info("👋 Left the voice channel.")] });
+
+      // Destroy connection if it exists
+      if (connection) {
+        connection.destroy();
+        logger.info({ guildId }, "Voice connection destroyed");
+      }
+
+      // Clean up player if it exists
+      if (player) {
+        const embed = embeds.get(guildId);
+        await embed?.destroy();
+        embeds.delete(guildId);
+        player.disconnect();
+        players.delete(guildId);
+      }
+
+      await interaction.reply({ embeds: [ok("👋 Left the voice channel.")] });
+      logger.info({ guildId }, "Bot left voice channel");
     },
   },
 ];
