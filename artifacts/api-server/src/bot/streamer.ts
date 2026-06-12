@@ -8,9 +8,12 @@ export interface TrackInfo {
   url: string;
   duration: string;
   thumbnail: string;
-  source: "youtube" | "soundcloud" | "spotify";
-  scFallbackQuery?: string;
+  source: "youtube" | "soundcloud";
 }
+
+// Search cache to avoid repeated API calls
+const searchCache = new Map<string, TrackInfo>();
+const CACHE_TTL = 3600000; // 1 hour
 
 function formatDuration(secs: number): string {
   if (!secs) return "Live";
@@ -21,255 +24,216 @@ function formatDuration(secs: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-// Validate FFmpeg is available
+// Validate FFmpeg
 function validateFFmpeg(): boolean {
   try {
     execSync("ffmpeg -version", { stdio: "ignore" });
+    logger.info("✅ FFmpeg is available");
     return true;
   } catch {
-    logger.warn("FFmpeg not found in PATH — audio streaming may fail");
+    logger.error("❌ FFmpeg not found — audio streaming will fail. Install ffmpeg-static.");
     return false;
   }
 }
 
-async function searchSpotify(query: string): Promise<TrackInfo | null> {
+async function searchYouTube(query: string): Promise<TrackInfo | null> {
   try {
-    const results = await playdl.search(query, { source: { spotify: "tracks" }, limit: 1 });
-    if (!results.length) return null;
-    const t = results[0]!;
-    return {
-      title: (t as any).name || t.title || "Unknown",
-      url: t.url,
-      duration: formatDuration(Math.floor((t as any).durationInMs / 1000) || 0),
-      thumbnail: (t as any).thumbnail || "",
-      source: "spotify",
-    };
+    logger.info({ query }, "🔍 Searching YouTube...");
+    
+    const results = await playdl.search(query, { 
+      source: { youtube: "video" }, 
+      limit: 5 
+    });
+    
+    if (!results.length) {
+      logger.warn({ query }, "YouTube: No results found");
+      return null;
+    }
+
+    // Find first playable result
+    for (const v of results) {
+      try {
+        const title = v.title ?? "Unknown";
+        const url = v.url;
+        const duration = formatDuration(v.durationInSec ?? 0);
+        const thumbnail = v.thumbnails?.at(-1)?.url ?? "";
+
+        logger.info({ title, url }, "✅ YouTube: Found track");
+        return {
+          title,
+          url,
+          duration,
+          thumbnail,
+          source: "youtube",
+        };
+      } catch (err) {
+        logger.warn({ err }, "YouTube: Video processing failed, trying next");
+        continue;
+      }
+    }
+
+    logger.error({ query }, "YouTube: All results failed to process");
+    return null;
   } catch (err) {
-    logger.warn({ err, query }, "Spotify search failed");
+    logger.error({ err, query }, "❌ YouTube search error");
     return null;
   }
 }
 
 async function searchSoundCloud(query: string): Promise<TrackInfo | null> {
   try {
-    const results = await playdl.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
-    if (!results.length) return null;
-    const t = results[0]!;
-    return {
-      title: (t as any).name,
-      url: t.url,
-      duration: formatDuration(Math.floor((t as any).durationInMs / 1000)),
-      thumbnail: (t as any).thumbnail,
-      source: "soundcloud",
-    };
-  } catch (err) {
-    logger.warn({ err, query }, "SoundCloud search failed");
-    return null;
-  }
-}
+    logger.info({ query }, "🔍 Searching SoundCloud...");
+    
+    const results = await playdl.search(query, { 
+      source: { soundcloud: "tracks" }, 
+      limit: 5 
+    });
 
-async function searchYouTube(query: string): Promise<TrackInfo | null> {
-  try {
-    logger.info({ query }, "Searching YouTube...");
-    const results = await playdl.search(query, { source: { youtube: "video" }, limit: 1 });
     if (!results.length) {
-      logger.warn({ query }, "YouTube search returned no results");
+      logger.warn({ query }, "SoundCloud: No results found");
       return null;
     }
-    const v = results[0]!;
-    return {
-      title: v.title ?? "Unknown",
-      url: v.url,
-      duration: formatDuration(v.durationInSec ?? 0),
-      thumbnail: v.thumbnails?.at(-1)?.url ?? "",
-      source: "youtube",
-      scFallbackQuery: v.title ?? query,
-    };
+
+    // Find first playable result
+    for (const t of results) {
+      try {
+        const title = (t as any).name ?? "Unknown";
+        const url = t.url;
+        const duration = formatDuration(Math.floor((t as any).durationInMs / 1000) ?? 0);
+        const thumbnail = (t as any).thumbnail ?? "";
+
+        logger.info({ title, url }, "✅ SoundCloud: Found track");
+        return {
+          title,
+          url,
+          duration,
+          thumbnail,
+          source: "soundcloud",
+        };
+      } catch (err) {
+        logger.warn({ err }, "SoundCloud: Track processing failed, trying next");
+        continue;
+      }
+    }
+
+    logger.error({ query }, "SoundCloud: All results failed to process");
+    return null;
   } catch (err) {
-    logger.warn({ err, query }, "YouTube search failed");
+    logger.error({ err, query }, "❌ SoundCloud search error");
     return null;
   }
 }
 
 export async function resolveTrack(query: string): Promise<TrackInfo | null> {
+  // Check cache first
+  const cacheKey = `search:${query}`;
+  if (searchCache.has(cacheKey)) {
+    logger.info({ query }, "📦 Found in search cache");
+    return searchCache.get(cacheKey)!;
+  }
+
   const isUrl = query.startsWith("http://") || query.startsWith("https://");
 
+  // Handle direct URLs
   if (isUrl) {
-    const ytType = playdl.yt_validate(query);
-    if (ytType === "video") {
+    // YouTube URL
+    if (query.includes("youtube.com") || query.includes("youtu.be")) {
       try {
-        logger.info({ url: query }, "Resolving YouTube URL...");
+        logger.info({ url: query }, "Resolving YouTube URL");
         const info = await playdl.video_info(query);
         const v = info.video_details;
-        const title = v.title ?? "YouTube Video";
-        return {
-          title,
+        const track: TrackInfo = {
+          title: v.title ?? "YouTube Video",
           url: query,
           duration: formatDuration(v.durationInSec ?? 0),
           thumbnail: v.thumbnails?.at(-1)?.url ?? "",
           source: "youtube",
-          scFallbackQuery: title,
         };
+        searchCache.set(cacheKey, track);
+        return track;
       } catch (err) {
         logger.error({ err, url: query }, "Failed to resolve YouTube URL");
         return null;
       }
     }
 
-    const scType = await playdl.so_validate(query);
-    if (scType === "track") {
+    // SoundCloud URL
+    if (query.includes("soundcloud.com")) {
       try {
-        logger.info({ url: query }, "Resolving SoundCloud URL...");
+        logger.info({ url: query }, "Resolving SoundCloud URL");
         const info = await playdl.soundcloud(query);
         if (info.type !== "track") return null;
-        const thumb = (info as { thumbnail?: string }).thumbnail ?? "";
-        return {
-          title: (info as any).name,
+
+        const track: TrackInfo = {
+          title: (info as any).name ?? "SoundCloud Track",
           url: info.url,
           duration: formatDuration(Math.floor((info as any).durationInMs / 1000)),
-          thumbnail: thumb,
+          thumbnail: (info as any).thumbnail ?? "",
           source: "soundcloud",
         };
+        searchCache.set(cacheKey, track);
+        return track;
       } catch (err) {
-        logger.error({ err, query }, "SoundCloud URL info failed");
+        logger.error({ err, url: query }, "Failed to resolve SoundCloud URL");
         return null;
       }
     }
-
-    // Try Spotify URL
-    try {
-      const spotifyMatch = query.match(/spotify\.com\/track\/([a-zA-Z0-9]+)/);
-      if (spotifyMatch) {
-        logger.info({ url: query }, "Resolving Spotify URL...");
-        return await searchSpotify(query);
-      }
-    } catch (err) {
-      logger.warn({ err, query }, "Spotify URL resolution failed");
-    }
   }
 
-  // For text searches: PRIMARY SEARCH ORDER (most reliable for Discord bots)
-  // 1. YouTube (largest music library, but may be IP-blocked on servers)
-  // 2. Spotify (reliable alternative, good metadata)
-  // 3. SoundCloud (backup option)
-
-  logger.info({ query }, "Starting search: YouTube → Spotify → SoundCloud");
-
-  // Try YouTube first
-  const yt = await searchYouTube(query);
-  if (yt) {
-    logger.info({ query, source: "youtube" }, "Found on YouTube");
-    return yt;
+  // Text search: Try YouTube FIRST (most songs are there)
+  logger.info({ query }, "🎵 Text search: YouTube → SoundCloud");
+  
+  const ytResult = await searchYouTube(query);
+  if (ytResult) {
+    searchCache.set(cacheKey, ytResult);
+    return ytResult;
   }
 
-  logger.info({ query }, "YouTube had no results, trying Spotify");
-
-  // Try Spotify second
-  const spotify = await searchSpotify(query);
-  if (spotify) {
-    logger.info({ query, source: "spotify" }, "Found on Spotify");
-    return spotify;
+  logger.info({ query }, "YouTube failed, trying SoundCloud...");
+  const scResult = await searchSoundCloud(query);
+  if (scResult) {
+    searchCache.set(cacheKey, scResult);
+    return scResult;
   }
 
-  logger.info({ query }, "Spotify had no results, trying SoundCloud");
-
-  // Try SoundCloud last
-  const sc = await searchSoundCloud(query);
-  if (sc) {
-    logger.info({ query, source: "soundcloud" }, "Found on SoundCloud");
-    return sc;
-  }
-
-  logger.error({ query }, "No results found on any source (YouTube, Spotify, SoundCloud)");
+  logger.error({ query }, "❌ No results found on YouTube or SoundCloud");
   return null;
 }
 
 export async function createStream(track: TrackInfo): Promise<Readable> {
-  if (track.source === "soundcloud") {
+  logger.info({ source: track.source, title: track.title }, "📥 Creating stream...");
+
+  // Try streaming with retries
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const s = await playdl.stream(track.url);
-      if (!s || !s.stream) {
-        throw new Error("SoundCloud stream returned empty");
+      logger.info({ attempt, source: track.source }, `Streaming attempt ${attempt}/3`);
+
+      const streamData = await playdl.stream(track.url);
+
+      if (!streamData || !streamData.stream) {
+        throw new Error("Stream returned empty");
       }
-      logger.info({ url: track.url }, "SoundCloud stream created successfully");
-      return s.stream as unknown as Readable;
+
+      logger.info({ source: track.source }, "✅ Stream created successfully");
+      return streamData.stream as unknown as Readable;
     } catch (err) {
-      logger.error({ err, url: track.url }, "Failed to create SoundCloud stream");
-      throw err;
+      logger.warn({ err, attempt, source: track.source }, `Attempt ${attempt} failed`);
+
+      if (attempt < 3) {
+        // Wait before retry
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+
+      // All attempts failed
+      logger.error({ err, source: track.source, url: track.url }, "All streaming attempts failed");
+      throw new Error(`Cannot stream "${track.title}" — all attempts exhausted`);
     }
   }
 
-  if (track.source === "spotify") {
-    try {
-      const s = await playdl.stream(track.url);
-      if (!s || !s.stream) {
-        throw new Error("Spotify stream returned empty");
-      }
-      logger.info({ url: track.url }, "Spotify stream created successfully");
-      return s.stream as unknown as Readable;
-    } catch (err) {
-      logger.error({ err, url: track.url }, "Failed to create Spotify stream, trying YouTube fallback");
-      if (track.scFallbackQuery) {
-        try {
-          const yt = await searchYouTube(track.scFallbackQuery);
-          if (yt) {
-            return await createStream(yt);
-          }
-        } catch {}
-      }
-      throw err;
-    }
-  }
-
-  // YouTube — attempt stream with quality fallback
-  try {
-    logger.info({ url: track.url }, "Attempting YouTube stream (quality: 2)");
-    const s = await playdl.stream(track.url, { quality: 2 });
-    if (!s || !s.stream) {
-      throw new Error("YouTube stream returned empty");
-    }
-    logger.info({ url: track.url }, "YouTube stream created successfully");
-    return s.stream as unknown as Readable;
-  } catch (ytErr) {
-    logger.warn({ err: ytErr, url: track.url }, "YouTube quality 2 failed, trying quality 1");
-
-    // Retry with lower quality
-    try {
-      const s = await playdl.stream(track.url, { quality: 1 });
-      if (!s || !s.stream) {
-        throw new Error("YouTube stream (quality 1) returned empty");
-      }
-      logger.info({ url: track.url }, "YouTube stream created successfully with quality 1");
-      return s.stream as unknown as Readable;
-    } catch (qualityErr) {
-      logger.warn({ err: qualityErr, url: track.url }, "YouTube quality 1 failed, trying Spotify fallback");
-
-      if (track.scFallbackQuery) {
-        try {
-          const spotifyTrack = await searchSpotify(track.scFallbackQuery);
-          if (spotifyTrack) {
-            logger.info({ query: track.scFallbackQuery }, "Found Spotify fallback");
-            return await createStream(spotifyTrack);
-          }
-        } catch (spotifyErr) {
-          logger.warn({ err: spotifyErr }, "Spotify fallback failed, trying SoundCloud");
-        }
-
-        try {
-          const scTrack = await searchSoundCloud(track.scFallbackQuery);
-          if (scTrack) {
-            logger.info({ url: scTrack.url }, "Found SoundCloud fallback");
-            return await createStream(scTrack);
-          }
-        } catch (scErr) {
-          logger.error({ err: scErr }, "SoundCloud fallback failed");
-        }
-      }
-
-      throw new Error(`Cannot stream "${track.title}" — all sources exhausted (YouTube → Spotify → SoundCloud).`);
-    }
-  }
+  throw new Error("Streaming failed");
 }
 
-// Validate FFmpeg on startup
+// Validate on startup
+logger.info("Initializing music streamer...");
 validateFFmpeg();
