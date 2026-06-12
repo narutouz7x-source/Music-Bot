@@ -117,7 +117,7 @@ export const commands = [
         opt.setName("query").setDescription("YouTube URL or search query").setRequired(true)
       ),
     async execute(interaction: ChatInputCommandInteraction) {
-      await interaction.deferReply();
+      await interaction.deferReply({ ephemeral: true });
       const guildId = interaction.guildId!;
       const player = getOrCreatePlayer(guildId);
 
@@ -129,24 +129,33 @@ export const commands = [
       try {
         const track = await resolveTrack(query);
         if (!track) {
-          await interaction.editReply({ embeds: [err("No results found.")] });
+          await interaction.editReply({ embeds: [err("No results found for that query.")] });
           return;
         }
 
         const entry = { ...track, requestedBy: interaction.user.tag };
+        const wasActive = player.isActive();
 
-        if (player.isActive()) {
-          player.queue.enqueue(entry);
+        player.queue.enqueue(entry);
+
+        if (wasActive) {
           await interaction.editReply({
-            embeds: [ok(`Added to queue (position **${player.queue.length}**)\n**${track.title}**`)],
+            embeds: [ok(`Added **${track.title}** to queue (position **${player.queue.length}**)`)],
           });
         } else {
-          player.queue.enqueue(entry);
           await player.processQueue();
           await interaction.editReply({
-            embeds: [ok(`▶️ Now playing: **${track.title}**`, "Now Playing")],
+            embeds: [ok(`▶️ Starting **${track.title}**`)],
           });
         }
+
+        const channel = interaction.channel as TextChannel | NewsChannel | ThreadChannel | null;
+        if (channel?.isTextBased()) {
+          const embed = embeds.get(guildId)!;
+          await embed.autoShow(channel as TextChannel | NewsChannel | ThreadChannel);
+        }
+
+        setTimeout(() => interaction.deleteReply().catch(() => {}), 5000);
       } catch (e) {
         logger.error({ err: e }, "Error in /play");
         await interaction.editReply({ embeds: [err("Something went wrong trying to play that track.")] });
