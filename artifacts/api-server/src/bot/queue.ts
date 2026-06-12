@@ -4,6 +4,7 @@ export interface QueueEntry {
   duration: string;
   thumbnail: string;
   requestedBy: string;
+  source: "youtube" | "soundcloud";
 }
 
 export type RepeatMode = "off" | "one" | "all";

@@ -9,7 +9,7 @@ import {
   StreamType,
 } from "@discordjs/voice";
 import ffmpegStatic from "ffmpeg-static";
-import { createYtdlpStream } from "./streamer.js";
+import { createStream } from "./streamer.js";
 import { MusicQueue, QueueEntry } from "./queue.js";
 import { logger } from "../lib/logger.js";
 
@@ -113,7 +113,7 @@ export class GuildPlayer {
   async play(entry: QueueEntry): Promise<void> {
     this.currentEntry = entry;
 
-    const stream = createYtdlpStream(entry.url);
+    const stream = await createStream(entry.url, entry.source);
 
     const resource: AudioResource = createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
@@ -124,7 +124,7 @@ export class GuildPlayer {
     this.audioPlayer.play(resource);
 
     await entersState(this.audioPlayer, AudioPlayerStatus.Playing, 30_000);
-    logger.info({ guildId: this.guildId, title: entry.title }, "Now playing");
+    logger.info({ guildId: this.guildId, title: entry.title, source: entry.source }, "Now playing");
     this.emit("trackStart");
   }
 
